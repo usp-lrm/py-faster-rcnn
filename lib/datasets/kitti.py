@@ -5,46 +5,54 @@
 # Written by Ross Girshick
 # --------------------------------------------------------
 
+import xml.dom.minidom as minidom
+
 import os
-from datasets.imdb import imdb
-import datasets.ds_utils as ds_utils
-import xml.etree.ElementTree as ET
+import PIL
 import numpy as np
 import scipy.sparse
-import scipy.io as sio
-import utils.cython_bbox
-import cPickle
 import subprocess
+import cPickle
+import math
+import glob
 import uuid
-from voc_eval import voc_eval
-from fast_rcnn.config import cfg
+import scipy.io as sio
+import xml.etree.ElementTree as ET
 
-class pascal_voc(imdb):
+from .imdb import imdb
+# from .imdb import ROOT_DIR
+import ds_utils
+from .voc_eval import voc_eval
+
+# TODO: make fast_rcnn irrelevant
+# >>>> obsolete, because it depends on sth outside of this project
+from fast_rcnn.config import cfg
+# <<<< obsolete
+
+
+class kitti(imdb):
     def __init__(self, image_set, year, devkit_path=None):
-        imdb.__init__(self, 'voc_' + year + '_' + image_set)
-        self._year = year
+        imdb.__init__(self, 'kitti_' + image_set)
         self._image_set = image_set
         self._devkit_path = self._get_default_path() if devkit_path is None \
                             else devkit_path
-        self._data_path = os.path.join(self._devkit_path, 'VOC' + self._year)
+        self._data_path = self._devkit_path
         self._classes = ('__background__', # always index 0
-                         'aeroplane', 'bicycle', 'bird', 'boat',
-                         'bottle', 'bus', 'car', 'cat', 'chair',
-                         'cow', 'diningtable', 'dog', 'horse',
-                         'motorbike', 'person', 'pottedplant',
-                         'sheep', 'sofa', 'train', 'tvmonitor')
+                         'pedestrian', 'car', 'cyclist')
         self._class_to_ind = dict(zip(self.classes, xrange(self.num_classes)))
         self._image_ext = '.jpg'
         self._image_index = self._load_image_set_index()
+        self._remove_empty_samples()
         # Default to roidb handler
-#        self._roidb_handler = self.selective_search_roidb()
+        #self._roidb_handler = self.selective_search_roidb
+        self._roidb_handler = self.gt_roidb
         self._salt = str(uuid.uuid4())
         self._comp_id = 'comp4'
-
+        self._year = ''
         # PASCAL specific config options
         self.config = {'cleanup'     : True,
                        'use_salt'    : True,
-                       'use_diff'    : False,
+                       'use_diff'    : False, # using difficult samples
                        'matlab_eval' : False,
                        'rpn_file'    : None,
                        'min_size'    : 2}
@@ -62,7 +70,9 @@ class pascal_voc(imdb):
 
     def image_path_from_index(self, index):
         """
-        Construct an image path from the image's "index" identifier.
+        Construct an image path from the image's "index" identifier
+        :param index filename stem e.g. 000000
+        :return filepath
         """
         image_path = os.path.join(self._data_path, 'JPEGImages',
                                   index + self._image_ext)
@@ -75,7 +85,6 @@ class pascal_voc(imdb):
         Load the indexes listed in this dataset's image set file.
         """
         # Example path to image set file:
-        # self._devkit_path + /VOCdevkit2007/VOC2007/ImageSets/Main/val.txt
         image_set_file = os.path.join(self._data_path, 'ImageSets', 'Main',
                                       self._image_set + '.txt')
         assert os.path.exists(image_set_file), \
@@ -88,11 +97,11 @@ class pascal_voc(imdb):
         """
         Return the default path where PASCAL VOC is expected to be installed.
         """
-        return os.path.join(cfg.DATA_DIR, 'VOCdevkit' + self._year)
+        return os.path.join(cfg.DATA_DIR, 'kitti')
 
     def gt_roidb(self):
         """
-        Return the database of ground-truth regions of interest.
+        Return the database of ground-truth regions of interest, aka, the annotations.
 
         This function loads/saves from/to a cache file to speed up future calls.
         """
@@ -127,7 +136,7 @@ class pascal_voc(imdb):
             print '{} ss roidb loaded from {}'.format(self.name, cache_file)
             return roidb
 
-        if int(self._year) == 2007 or self._image_set != 'test':
+        if self._image_set != 'test':
             gt_roidb = self.gt_roidb()
             ss_roidb = self._load_selective_search_roidb(gt_roidb)
             roidb = imdb.merge_roidbs(gt_roidb, ss_roidb)
@@ -140,7 +149,7 @@ class pascal_voc(imdb):
         return roidb
 
     def rpn_roidb(self):
-        if int(self._year) == 2007 or self._image_set != 'test':
+        if self._image_set != 'test':
             gt_roidb = self.gt_roidb()
             rpn_roidb = self._load_rpn_roidb(gt_roidb)
             roidb = imdb.merge_roidbs(gt_roidb, rpn_roidb)
@@ -159,7 +168,7 @@ class pascal_voc(imdb):
         return self.create_roidb_from_box_list(box_list, gt_roidb)
 
     def _load_selective_search_roidb(self, gt_roidb):
-        filename = os.path.abspath(os.path.join(cfg.DATA_DIR,
+        filename = os.path.abspath(os.path.join(self._data_path,
                                                 'selective_search_data',
                                                 self.name + '.mat'))
         assert os.path.exists(filename), \
@@ -177,6 +186,25 @@ class pascal_voc(imdb):
 
         return self.create_roidb_from_box_list(box_list, gt_roidb)
 
+    def _remove_empty_samples(self):
+        """
+        Remove images with zero annotation ()
+        """
+        print 'Remove empty annotations: ',
+        for i in range(len(self._image_index)-1, -1, -1):
+            index = self._image_index[i]
+            filename = os.path.join(self._data_path, 'Annotations', index + '.xml')
+            tree = ET.parse(filename)
+            objs = tree.findall('object')
+            non_diff_objs = [
+                obj for obj in objs if \
+                    int(obj.find('difficult').text) == 0 and obj.find('name').text.lower().strip() != 'dontcare']
+            num_objs = len(non_diff_objs)
+            if num_objs == 0:
+                print index,
+                self._image_index.pop(i)
+        print 'Done. '
+
     def _load_pascal_annotation(self, index):
         """
         Load image and bounding boxes info from XML file in the PASCAL VOC
@@ -185,40 +213,64 @@ class pascal_voc(imdb):
         filename = os.path.join(self._data_path, 'Annotations', index + '.xml')
         tree = ET.parse(filename)
         objs = tree.findall('object')
-        if not self.config['use_diff']:
-            # Exclude the samples labeled as difficult
-            non_diff_objs = [
-                obj for obj in objs if int(obj.find('difficult').text) == 0]
-            # if len(non_diff_objs) != len(objs):
-            #     print 'Removed {} difficult objects'.format(
-            #         len(objs) - len(non_diff_objs))
-            objs = non_diff_objs
+        # if not self.config['use_diff']:
+        #     # Exclude the samples labeled as difficult
+        #     non_diff_objs = [
+        #         obj for obj in objs if int(obj.find('difficult').text) == 0]
+        #     objs = non_diff_objs
         num_objs = len(objs)
 
-        boxes = np.zeros((num_objs, 4), dtype=np.uint16)
+        boxes = np.zeros((num_objs, 4), dtype=np.int32)
         gt_classes = np.zeros((num_objs), dtype=np.int32)
+        # just the same as gt_classes
         overlaps = np.zeros((num_objs, self.num_classes), dtype=np.float32)
         # "Seg" area for pascal is just the box area
         seg_areas = np.zeros((num_objs), dtype=np.float32)
+
+        ishards = np.zeros((num_objs), dtype=np.int32)
+        care_inds = np.empty((0), dtype=np.int32)
+        dontcare_inds = np.empty((0), dtype=np.int32)
 
         # Load object bounding boxes into a data frame.
         for ix, obj in enumerate(objs):
             bbox = obj.find('bndbox')
             # Make pixel indexes 0-based
-            x1 = float(bbox.find('xmin').text) - 1
-            y1 = float(bbox.find('ymin').text) - 1
+            x1 = max(float(bbox.find('xmin').text) - 1, 0)
+            y1 = max(float(bbox.find('ymin').text) - 1, 0)
             x2 = float(bbox.find('xmax').text) - 1
             y2 = float(bbox.find('ymax').text) - 1
-            cls = self._class_to_ind[obj.find('name').text.lower().strip()]
+
+            diffc = obj.find('difficult')
+            difficult = 0 if diffc == None else int(diffc.text)
+            ishards[ix] = difficult
+
+            class_name = obj.find('name').text.lower().strip()
+            if class_name != 'dontcare':
+                care_inds = np.append(care_inds, np.asarray([ix], dtype=np.int32))
+            if class_name == 'dontcare':
+                dontcare_inds = np.append(dontcare_inds, np.asarray([ix], dtype=np.int32))
+                boxes[ix, :] = [x1, y1, x2, y2]
+                continue
+            cls = self._class_to_ind[class_name]
             boxes[ix, :] = [x1, y1, x2, y2]
             gt_classes[ix] = cls
             overlaps[ix, cls] = 1.0
             seg_areas[ix] = (x2 - x1 + 1) * (y2 - y1 + 1)
 
+        # deal with dontcare areas
+        dontcare_areas = boxes[dontcare_inds, :]
+        boxes = boxes[care_inds, :]
+        gt_classes = gt_classes[care_inds]
+        overlaps = overlaps[care_inds, :]
+        seg_areas = seg_areas[care_inds]
+        ishards = ishards[care_inds]
+
         overlaps = scipy.sparse.csr_matrix(overlaps)
 
         return {'boxes' : boxes,
                 'gt_classes': gt_classes,
+                'gt_ishard' : ishards,
+                'dontcare_areas' : dontcare_areas,
                 'gt_overlaps' : overlaps,
                 'flipped' : False,
                 'seg_areas' : seg_areas}
@@ -231,12 +283,10 @@ class pascal_voc(imdb):
     def _get_voc_results_file_template(self):
         # VOCdevkit/results/VOC2007/Main/<comp_id>_det_test_aeroplane.txt
         filename = self._get_comp_id() + '_det_' + self._image_set + '_{:s}.txt'
-        path = os.path.join(
-            self._devkit_path,
-            'results',
-            'VOC' + self._year,
-            'Main',
-            filename)
+        filedir = os.path.join(self._devkit_path, 'results', 'KITTI', 'Main')
+        if not os.path.exists(filedir):
+            os.makedirs(filedir)
+        path = os.path.join(filedir, filename)
         return path
 
     def _write_voc_results_file(self, all_boxes):
@@ -253,26 +303,22 @@ class pascal_voc(imdb):
                     # the VOCdevkit expects 1-based indices
                     for k in xrange(dets.shape[0]):
                         f.write('{:s} {:.3f} {:.1f} {:.1f} {:.1f} {:.1f}\n'.
-                                format(index, dets[k, -1],
-                                       dets[k, 0] + 1, dets[k, 1] + 1,
-                                       dets[k, 2] + 1, dets[k, 3] + 1))
+                            format(index, dets[k, -1],              # filename(stem), score
+                                   dets[k, 0] + 1, dets[k, 1] + 1,  # x1, y1, x2, y2
+                                   dets[k, 2] + 1, dets[k, 3] + 1))
 
     def _do_python_eval(self, output_dir = 'output'):
         annopath = os.path.join(
             self._devkit_path,
-            'VOC' + self._year,
-            'Annotations',
-            '{:s}.xml')
+            'Annotations', '{:s}.xml')
         imagesetfile = os.path.join(
             self._devkit_path,
-            'VOC' + self._year,
-            'ImageSets',
-            'Main',
+            'ImageSets', 'Main',
             self._image_set + '.txt')
         cachedir = os.path.join(self._devkit_path, 'annotations_cache')
         aps = []
         # The PASCAL VOC metric changed in 2010
-        use_07_metric = True if int(self._year) < 2010 else False
+        use_07_metric = False
         print 'VOC07 metric? ' + ('Yes' if use_07_metric else 'No')
         if not os.path.isdir(output_dir):
             os.mkdir(output_dir)
@@ -280,9 +326,8 @@ class pascal_voc(imdb):
             if cls == '__background__':
                 continue
             filename = self._get_voc_results_file_template().format(cls)
-            rec, prec, ap = voc_eval(
-                filename, annopath, imagesetfile, cls, cachedir, ovthresh=0.5,
-                use_07_metric=use_07_metric)
+            rec, prec, ap = voc_eval(filename, annopath, imagesetfile, cls, cachedir,
+                                     ovthresh=0.5, use_07_metric = use_07_metric)
             aps += [ap]
             print('AP for {} = {:.4f}'.format(cls, ap))
             with open(os.path.join(output_dir, cls + '_pr.pkl'), 'w') as f:
@@ -317,6 +362,7 @@ class pascal_voc(imdb):
         print('Running:\n{}'.format(cmd))
         status = subprocess.call(cmd, shell=True)
 
+
     def evaluate_detections(self, all_boxes, output_dir):
         self._write_voc_results_file(all_boxes)
         self._do_python_eval(output_dir)
@@ -338,7 +384,7 @@ class pascal_voc(imdb):
             self.config['cleanup'] = True
 
 if __name__ == '__main__':
-    from datasets.pascal_voc import pascal_voc
-    d = pascal_voc('trainval', '2007')
+    d = kitti('trainval')
     res = d.roidb
     from IPython import embed; embed()
+
